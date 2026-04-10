@@ -32,6 +32,10 @@ app.get('/', (req, res) => {
 
 // Proxy endpoint
 app.post('/api/claude-proxy', async (req, res) => {
+  // Set a long timeout on the response to prevent Railway from closing it
+  req.setTimeout(300000);
+  res.setTimeout(300000);
+
   if (!ANTHROPIC_API_KEY) {
     return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured' });
   }
@@ -45,17 +49,23 @@ app.post('/api/claude-proxy', async (req, res) => {
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify(req.body),
+      signal: AbortSignal.timeout(280000),
     });
 
     const data = await response.json();
     return res.status(response.status).json(data);
 
   } catch (err) {
-    console.error('Proxy error:', err);
+    console.error('Proxy error:', err.name, err.message);
     return res.status(502).json({ error: 'Proxy error: ' + err.message });
   }
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`JMR Claude Proxy listening on port ${PORT}`);
 });
+
+// Set server-level timeout to 5 minutes
+server.timeout = 300000;
+server.keepAliveTimeout = 300000;
+server.headersTimeout = 301000;
