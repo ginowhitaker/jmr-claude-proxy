@@ -13,7 +13,6 @@ const ALLOWED_ORIGINS = [
 
 app.use(express.json({ limit: '10mb' }));
 
-// CORS middleware
 app.use((req, res, next) => {
   const origin = req.headers.origin || '';
   if (ALLOWED_ORIGINS.includes(origin) || !origin) {
@@ -25,22 +24,26 @@ app.use((req, res, next) => {
   next();
 });
 
-// Health check
 app.get('/', (req, res) => {
   res.json({ status: 'JMR Claude Proxy running' });
 });
 
-// Proxy endpoint — streams response back to keep connection alive
+// Streaming proxy — buffers the full Anthropic streaming response,
+// sends incremental SSE-style chunks so Railway's proxy doesn't time out,
+// then emits the complete JSON response at the end.
 app.post('/api/claude-proxy', async (req, res) => {
-  req.setTimeout(0);   // disable request timeout
-  res.setTimeout(0);   // disable response timeout
-
   if (!ANTHROPIC_API_KEY) {
     return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured' });
   }
 
+  // Force streaming on the Anthropic request
+  const body = { ...req.body, stream: true };
+
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Transfer-Encoding', 'chunked');
+  res.setHeader('X-Accel-Buffering', 'no'); // disable nginx buffering if present
+
   try {
-    // Use streaming to keep the connection alive during long generations
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -48,25 +51,92 @@ app.post('/api/claude-proxy', async (req, res) => {
         'x-api-key': ANTHROPIC_API_KEY,
         'anthropic-version': '2023-06-01',
       },
-      body: JSON.stringify(req.body),
-      signal: AbortSignal.timeout(580000), // 9.5 minute hard limit
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(580000),
     });
 
-    const data = await response.json();
-    return res.status(response.status).json(data);
+    if (!response.ok) {
+      const errData = await response.json();
+      return res.status(response.status).json(errData);
+    }
+
+    // Read the SSE stream, accumulate content, keep connection alive
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+
+    let fullText = '';
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let stopReason = null;
+    let model = req.body.model || 'unknown';
+    let lastFlush = Date.now();
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      const chunk = decoder.decode(value, { stream: true });
+      const lines = chunk.split('\n');
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const data = line.slice(6).trim();
+        if (data === '[DONE]') continue;
+
+        try {
+          const event = JSON.parse(data);
+
+          if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
+            fullText += event.delta.text;
+          }
+          if (event.type === 'message_delta') {
+            stopReason = event.delta?.stop_reason || stopReason;
+            outputTokens = event.usage?.output_tokens || outputTokens;
+          }
+          if (event.type === 'message_start') {
+            inputTokens = event.message?.usage?.input_tokens || 0;
+            model = event.message?.model || model;
+          }
+        } catch (e) {
+          // skip malformed events
+        }
+      }
+
+      // Send a whitespace keepalive byte every 5 seconds to prevent Railway proxy timeout
+      const now = Date.now();
+      if (now - lastFlush > 5000) {
+        res.write(' ');
+        lastFlush = now;
+      }
+    }
+
+    // Emit the complete response in standard Anthropic messages format
+    const finalResponse = {
+      id: 'msg_streamed',
+      type: 'message',
+      role: 'assistant',
+      model: model,
+      content: [{ type: 'text', text: fullText }],
+      stop_reason: stopReason || 'end_turn',
+      usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+    };
+
+    res.end(JSON.stringify(finalResponse));
 
   } catch (err) {
     console.error('Proxy error:', err.name, err.message);
-    return res.status(502).json({ error: 'Proxy error: ' + err.message });
+    if (!res.headersSent) {
+      res.status(502).json({ error: 'Proxy error: ' + err.message });
+    } else {
+      res.end(JSON.stringify({ error: 'Proxy error: ' + err.message }));
+    }
   }
 });
 
 const server = app.listen(PORT, () => {
-  console.log(`JMR Claude Proxy listening on port ${PORT}`);
+  console.log(`JMR Claude Proxy (streaming) listening on port ${PORT}`);
 });
 
-// Completely disable all server-level timeouts
 server.timeout = 0;
-server.keepAliveTimeout = 620000;  // 10+ minutes
+server.keepAliveTimeout = 620000;
 server.headersTimeout = 630000;
-server.requestTimeout = 0;
