@@ -30,17 +30,17 @@ app.get('/', (req, res) => {
   res.json({ status: 'JMR Claude Proxy running' });
 });
 
-// Proxy endpoint
+// Proxy endpoint — streams response back to keep connection alive
 app.post('/api/claude-proxy', async (req, res) => {
-  // Set a long timeout on the response to prevent Railway from closing it
-  req.setTimeout(300000);
-  res.setTimeout(300000);
+  req.setTimeout(0);   // disable request timeout
+  res.setTimeout(0);   // disable response timeout
 
   if (!ANTHROPIC_API_KEY) {
     return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured' });
   }
 
   try {
+    // Use streaming to keep the connection alive during long generations
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -49,7 +49,7 @@ app.post('/api/claude-proxy', async (req, res) => {
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify(req.body),
-      signal: AbortSignal.timeout(280000),
+      signal: AbortSignal.timeout(580000), // 9.5 minute hard limit
     });
 
     const data = await response.json();
@@ -65,7 +65,8 @@ const server = app.listen(PORT, () => {
   console.log(`JMR Claude Proxy listening on port ${PORT}`);
 });
 
-// Set server-level timeout to 5 minutes
-server.timeout = 300000;
-server.keepAliveTimeout = 300000;
-server.headersTimeout = 301000;
+// Completely disable all server-level timeouts
+server.timeout = 0;
+server.keepAliveTimeout = 620000;  // 10+ minutes
+server.headersTimeout = 630000;
+server.requestTimeout = 0;
